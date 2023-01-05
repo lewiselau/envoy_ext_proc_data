@@ -9,7 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
-	"strings"
+	//"strings"
 	"syscall"
 	"time"
 
@@ -25,11 +25,9 @@ import (
 
 	v3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_proc/v3"
 	pb "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
-	clientv3 "go.etcd.io/etcd/client/v3"
 
 	"net/http"
 
-	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
@@ -40,14 +38,7 @@ var (
 
 var userName string = ""
 
-var userCall = prometheus.NewCounterVec(
-	prometheus.CounterOpts{
-		Name: "department_user_call_count_celsius",
-		Help: "The current user API call count in degrees Celsius.",
-	},
-	// 指定标签名称
-	[]string{"department", "user"},
-)
+var userCall map[string]int = make(map[string]int, 100)
 
 var userDepart map[string]string = map[string]string{
 	"sal":   "account",
@@ -57,9 +48,6 @@ var userDepart map[string]string = map[string]string{
 }
 var departName string = ""
 var departCount int = 0
-var etcdCli *clientv3.Client
-
-const ()
 
 type server struct{}
 
@@ -76,11 +64,25 @@ func (s *healthServer) Watch(in *healthpb.HealthCheckRequest, srv healthpb.Healt
 
 func prom() {
 	// 注册到全局默认注册表中
-	prometheus.MustRegister(userCall)
+	//prometheus.MustRegister(userCall)
 
 	// 暴露自定义的指标
 	http.Handle("/metrics", promhttp.Handler())
 	http.ListenAndServe(":9090", nil)
+}
+
+func getDepartCount(user string) int {
+	depart := userDepart[user]
+	log.Println(depart)
+
+	var departCount int = 0
+	for k, v := range userCall {
+		if userDepart[k] == depart {
+			departCount = departCount + v
+		}
+	}
+
+	return departCount
 }
 
 func (s *server) Process(srv pb.ExternalProcessor_ProcessServer) error {
@@ -111,25 +113,27 @@ func (s *server) Process(srv pb.ExternalProcessor_ProcessServer) error {
 			//log.Printf("Got RequestHeaders.Attributes %v", h.RequestHeaders.Attributes)
 			//log.Printf("Got RequestHeaders.Headers %v", h.RequestHeaders.Headers)
 
-			isPOST := false
+			isGET := false
 			for _, n := range h.RequestHeaders.Headers.Headers {
-				if n.Key == ":method" && n.Value == "POST" {
-					isPOST = true
+				if n.Key == ":method" && n.Value == "GET" {
+					isGET = true
 					break
 				}
 			}
 
 			for _, n := range h.RequestHeaders.Headers.Headers {
 				log.Printf("Header %s %s", n.Key, n.Value)
-				if n.Key == "user" && isPOST {
+				if n.Key == "user" && isGET {
 					userName = n.Value
 					departName = userDepart[userName]
-					userCall.WithLabelValues(departName, userName).Inc()
-
-					// write to etcd
-					res, err := etcdCli.Get(context.TODO(), "/api-call-count/"+userName)
-					count, _ := strconv.Atoi(string(res.Kvs[0].Value))
-					_, err = etcdCli.Put(context.TODO(), "/api-call-count/"+userName, strconv.Itoa(count+1))
+					if userCall[userName] == 0 {
+						userCall[userName] = 1
+					} else {
+						userCall[userName]++
+					}
+					departCount = getDepartCount(userName)
+					// write to log
+					log.Println("Api-Call-Counting --- Department:[" + departName + ":" + strconv.Itoa(departCount) + "] User:[" + userName + ":" + strconv.Itoa(userCall[userName]) + "]")
 					if err != nil {
 						log.Println("failed to write to etcd for user: " + userName)
 					}
@@ -271,30 +275,6 @@ func (s *server) Process(srv pb.ExternalProcessor_ProcessServer) error {
 }
 
 func main() {
-	// 创建连接
-	cli, err := clientv3.New(clientv3.Config{
-		Endpoints:   []string{"127.0.0.1:2379"},
-		DialTimeout: 5 * time.Second,
-	})
-	if err != nil {
-		return
-	}
-	etcdCli = cli
-	defer func(client *clientv3.Client) {
-		_ = client.Close()
-	}(cli)
-
-	// 查看以/api-call-count/为前缀的
-	get, err := cli.Get(context.TODO(), "/api-call-count/", clientv3.WithPrefix())
-	if err != nil {
-		return
-	}
-	for _, kv := range get.Kvs {
-		index := strings.LastIndex(string(kv.Key), "/")
-		userName = string(kv.Key)[index+1:]
-		count, _ := strconv.Atoi(string(kv.Value))
-		userCall.WithLabelValues(userDepart[userName], userName).Add(float64(count))
-	}
 
 	// start http server for prometheus  //localhost:9090/metrics
 	go prom()
